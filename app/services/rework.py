@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.db import get_db
 from app.services import audit as audit_svc
+from app.services import pin_batch as pin_batch_svc
 from app.services import settings as settings_svc
 from app.services.errors import ServiceError
 
@@ -22,6 +23,9 @@ def list_jobs(db_path: str | None = None) -> list[dict]:
 
 
 def run_job(job_id: int, succeed: bool = True, db_path: str | None = None) -> dict:
+    if succeed:
+        # 回炉成功会把坏件放回合格流：同样受钉批落点闸约束。
+        pin_batch_svc.require_pack_or_raise(db_path)
     with get_db(db_path) as conn:
         job = conn.execute("SELECT * FROM rework_jobs WHERE id=?", (job_id,)).fetchone()
         if not job:

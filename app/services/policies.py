@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from app.db import get_db
 from app.services import audit as audit_svc
+from app.services import pin_batch as pin_batch_svc
 from app.services import quarantine as quarantine_svc
 from app.services.errors import ServiceError
 
@@ -75,6 +76,8 @@ def set_enabled(rule_id: int, enabled: bool, db_path: str | None = None) -> dict
 
 def apply_to_batch(batch_id: int, db_path: str | None = None) -> dict:
     """Apply enabled policy rules to pending bad items in a batch."""
+    # 清洗编排继续执行前必须核钉批芯片 / 批次号 / 落点一致。
+    pin_batch_svc.require_pack_or_raise(db_path)
     with get_db(db_path) as conn:
         batch = conn.execute(
             "SELECT * FROM capture_batches WHERE id=?", (batch_id,)

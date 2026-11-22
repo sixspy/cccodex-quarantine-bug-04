@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.db import get_db
 from app.services import audit as audit_svc
+from app.services import pin_batch as pin_batch_svc
 from app.services.errors import ServiceError
 
 
@@ -29,6 +30,9 @@ def decide(
 ) -> dict:
     if decision not in ("放行", "驳回回炉", "废弃"):
         raise ServiceError("裁决无效")
+    if decision == "放行":
+        # 放行会继续推进清洗编排：钉批落点缺失 / 芯片无落点 / 指纹拧花一律挡。
+        pin_batch_svc.require_pack_or_raise(db_path)
     with get_db(db_path) as conn:
         ticket = conn.execute(
             "SELECT * FROM review_tickets WHERE id=?", (ticket_id,)

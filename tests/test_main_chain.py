@@ -1,4 +1,4 @@
-from app.services import captures, quarantine, reconcile, review, rework
+from app.services import captures, pin_batch, quarantine, reconcile, review, rework
 
 
 def test_enter_review_rework_reconcile(db_path):
@@ -10,6 +10,8 @@ def test_enter_review_rework_reconcile(db_path):
     bad = next(i for i in detail["items"] if i["quality"] != "合格" and i["status"] == "待检")
     row = quarantine.enter_item(bad["id"], open_bin["id"], "测试入舱", db_path)
     assert row["status"] == "待复核"
+    # 放行/回炉成功受钉批落点闸约束：先落钉批。
+    pin_batch.commit_batch(batch["id"], "链路用例", db_path)
     tickets = review.list_tickets(db_path)
     ticket = next(t for t in tickets if t["row_id"] == row["id"] and t["decision"] == "待决")
     decided = review.decide(ticket["id"], "驳回回炉", "tester", "回炉", db_path)

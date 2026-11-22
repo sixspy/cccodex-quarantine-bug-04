@@ -114,6 +114,10 @@ CREATE TABLE IF NOT EXISTS reconcile_reports (
   reworking INTEGER NOT NULL,
   abandoned INTEGER NOT NULL,
   mismatch INTEGER NOT NULL,
+  pinned_batch_code TEXT NOT NULL DEFAULT '',
+  pinned_fingerprint TEXT NOT NULL DEFAULT '',
+  fingerprint_match INTEGER NOT NULL DEFAULT 0,
+  gate_allows INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -127,6 +131,29 @@ CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS pin_batch_ledger (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id INTEGER NOT NULL REFERENCES capture_batches(id),
+  batch_code TEXT NOT NULL,
+  bad_fingerprint TEXT NOT NULL,
+  bad_count INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS pin_batch_snapshot (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ledger_id INTEGER NOT NULL REFERENCES pin_batch_ledger(id),
+  item_id INTEGER NOT NULL,
+  item_key TEXT NOT NULL,
+  quality TEXT NOT NULL,
+  item_fingerprint TEXT NOT NULL,
+  UNIQUE(ledger_id, item_id)
+);
+
+-- 单读轨硬约束：库层只允许一条钉批落点，防止并发双写覆盖。
+CREATE UNIQUE INDEX IF NOT EXISTS pin_batch_single_track ON pin_batch_ledger((1));
 """
 
 
@@ -136,8 +163,25 @@ def ensure_db() -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         conn.commit()
     return path
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """旧库补列：对账报告要带上钉批只读引用。"""
+    cols = {
+        r[1] for r in conn.execute("PRAGMA table_info(reconcile_reports)").fetchall()
+    }
+    additions = {
+        "pinned_batch_code": "TEXT NOT NULL DEFAULT ''",
+        "pinned_fingerprint": "TEXT NOT NULL DEFAULT ''",
+        "fingerprint_match": "INTEGER NOT NULL DEFAULT 0",
+        "gate_allows": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for name, decl in additions.items():
+        if name not in cols:
+            conn.execute(f"ALTER TABLE reconcile_reports ADD COLUMN {name} {decl}")
 
 
 @contextmanager

@@ -218,7 +218,7 @@ def create_app():
         # reconcile / settings
         def reports_list(request):
             _require(request)
-            return _json({"items": reconcile_svc.list_reports()})
+            return _json({"items": reconcile_svc.report_rows(), "pin": pin_batch_svc.snapshot()})
 
         def report_run(request):
             _require(request)
@@ -318,10 +318,6 @@ def create_app():
             body = _read_json(request)
             return _json(pin_batch_svc.commit_action(body))
 
-        def pin_batch_half(request):
-            _require(request)
-            return _json(pin_batch_svc.reconcile_display())
-
         def pin_batch_snap(request):
             _require(request)
             return _json(pin_batch_svc.snapshot())
@@ -331,7 +327,7 @@ def create_app():
             body = _read_json(request)
             return _json(
                 pin_batch_cutover_svc.append_cutover(
-                    int(body.get("ref_id") or 0),
+                    int(body.get("ref_id") or body.get("batch_id") or 0),
                     str(body.get("note") or "钉批落定"),
                 )
             )
@@ -381,7 +377,6 @@ def create_app():
         config.add_route("audits", "/api/audits")
         config.add_route("pin_batch_dash", "/api/pin_batch/dash")
         config.add_route("pin_batch_commit", "/api/pin_batch/commit")
-        config.add_route("pin_batch_half", "/api/pin_batch/half")
         config.add_route("pin_batch_snap", "/api/pin_batch/snap")
         config.add_route("pin_batch_cutover", "/api/pin_batch/cutover")
         config.add_route("pin_batch_dual", "/api/pin_batch/dual")
@@ -425,7 +420,6 @@ def create_app():
         config.add_view(wrap(audits_list), route_name="audits", request_method="GET")
         config.add_view(wrap(pin_batch_dash), route_name="pin_batch_dash", request_method="GET")
         config.add_view(wrap(pin_batch_commit), route_name="pin_batch_commit", request_method="POST")
-        config.add_view(wrap(pin_batch_half), route_name="pin_batch_half", request_method="POST")
         config.add_view(wrap(pin_batch_snap), route_name="pin_batch_snap", request_method="GET")
         config.add_view(wrap(pin_batch_cutover), route_name="pin_batch_cutover", request_method="POST")
         config.add_view(wrap(pin_batch_dual), route_name="pin_batch_dual", request_method="POST")

@@ -1,81 +1,29 @@
-"""对账钉批双写两轨：应将旧档送入只读归档并改读新旗；当前只亮镜像芯片。"""
+"""对账钉批双写两轨：本台只允许单读轨（切流账册），双写一律拒绝。"""
 from __future__ import annotations
 
-from app.db import get_db
-from app.services.pin_batch import (
-    active_read_ref,
-    archive_rows,
-    dashboard,
-    live_flag,
-    paint_ok,
-    truth_flag,
-)
-
-_SLUG = "pin_batch"
-_OK = "钉批已亮"
-_BAD = "库无钉批"
-_TITLE = "对账钉批"
-
-
-def _meta_set(conn, key: str, value: str) -> None:
-    conn.execute(
-        "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
-        (key, value),
-    )
-
-
-def dual_chip(db_path: str | None = None) -> str:
-    with get_db(db_path) as conn:
-        row = conn.execute(
-            "SELECT value FROM meta WHERE key=?",
-            (f"{_SLUG}_dual_chip",),
-        ).fetchone()
-        return row["value"] if row else _OK
-
-
-def seed_dual(db_path: str | None = None) -> None:
-    with get_db(db_path) as conn:
-        _meta_set(conn, f"{_SLUG}_dual_chip", _OK)
-        _meta_set(conn, f"{_SLUG}_dual_truth", _BAD)
-        # missing archive move + live_flag + active_read=live_flag
+from app.services import pin_batch as pin_svc
+from app.services.errors import ServiceError
 
 
 def apply_dualwrite(note: str = "", db_path: str | None = None) -> dict:
-    seed_dual(db_path)
-    paint_ok(db_path)
-    with get_db(db_path) as conn:
-        _meta_set(conn, f"{_SLUG}_dual_note", note or _TITLE)
-        # intentionally skip archive_% and live_flag rewrite
-    return {
-        "dual_chip": dual_chip(db_path),
-        "truth": truth_flag(db_path),
-        "active_read": active_read_ref(db_path),
-        "archive_count": len(archive_rows(db_path)),
-        "live_flag": live_flag(db_path),
-    }
+    raise ServiceError(
+        "双写两轨未启用：本台只走切流账册单读轨，禁止双开",
+        409,
+    )
 
 
 def dual_board(db_path: str | None = None) -> dict:
-    seed_dual(db_path)
-    dash = dashboard(db_path)
+    snap = pin_svc.snapshot(db_path)
     return {
-        "dual_chip": dual_chip(db_path),
-        "truth": truth_flag(db_path),
-        "active_read": active_read_ref(db_path),
-        "archive": archive_rows(db_path),
-        "live_flag": live_flag(db_path),
-        "dash": dash,
-        "fate": "dualwrite",
-        "panel_pack_mismatch": True,
-        "title": f"{_TITLE}双写面",
+        "title": "对账钉批双写面",
+        "dual_chip": "未启用",
+        "enabled": False,
+        "reason": "单读轨（切流账册）已收口，双写禁止双开",
+        "active_read": snap["active_read"],
+        "batch_code": snap["batch_code"],
+        "gate_allows": snap["gate_allows"],
     }
 
 
 def half_dual(db_path: str | None = None) -> dict:
-    paint_ok(db_path)
-    seed_dual(db_path)
-    return {
-        "dual_chip": dual_chip(db_path),
-        "truth": truth_flag(db_path),
-        "active_read": active_read_ref(db_path),
-    }
+    return dual_board(db_path)

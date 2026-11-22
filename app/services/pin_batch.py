@@ -1,16 +1,22 @@
-"""钉批落定：切流账册与双写两轨收口面；展示可绿、读轨仍旧。"""
+"""对账钉批落点：切流账册钉住当刻批次号与坏件指纹，供对账只读引用。
+
+单一读轨（切流账册）是唯一允许的落点；双写两轨一律拒绝，避免双开。
+所有写入走整笔事务；失败抛白话。
+"""
 from __future__ import annotations
+
+import hashlib
+import sqlite3
 
 from app.db import get_db
 from app.services.errors import ServiceError
 
-_SLUG = "pin_batch"
-_OK = "钉批已亮"
-_BAD = "库无钉批"
-_TITLE = "对账钉批"
-_OLD = "old_track"
-_CUTOVER = "cutover_book"
-_LIVE = "live_flag"
+SLUG = "pin_batch"
+CHIP_OK = "钉批已亮"
+CHIP_BAD = "库无钉批"
+TITLE = "对账钉批"
+READ_CUTOVER = "cutover_book"
+READ_OLD = "old_track"
 
 
 def _meta_get(conn, key: str, default: str = "") -> str:
@@ -20,220 +26,278 @@ def _meta_get(conn, key: str, default: str = "") -> str:
 
 def _meta_set(conn, key: str, value: str) -> None:
     conn.execute(
-        "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+        "INSERT INTO meta(key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (key, value),
     )
 
 
+# ------------------------------------------------------------------ 指纹
+def bad_fingerprint(batch_id: int, db_path: str | None = None) -> str:
+    """按条目键排序，对坏件的键/质量/载荷取指纹；空集合也有稳定指纹。"""
+    with get_db(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT item_key, quality, payload FROM capture_items
+            WHERE batch_id=? AND quality!='合格'
+            ORDER BY item_key
+            """,
+            (batch_id,),
+        ).fetchall()
+    h = hashlib.sha256()
+    for r in rows:
+        h.update(f"{r['item_key']}\x1f{r['quality']}\x1f{r['payload']}\x1e".encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def _item_fingerprint(item_key: str, quality: str, payload: str) -> str:
+    h = hashlib.sha256()
+    h.update(f"{item_key}\x1f{quality}\x1f{payload}".encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+# ------------------------------------------------------------------ 读端
 def panel_chip(db_path: str | None = None) -> str:
     with get_db(db_path) as conn:
-        return _meta_get(conn, f"{_SLUG}_panel_chip", _OK)
-
-
-def truth_flag(db_path: str | None = None) -> str:
-    with get_db(db_path) as conn:
-        return _meta_get(conn, f"{_SLUG}_truth", _BAD)
+        return _meta_get(conn, f"{SLUG}_panel_chip", CHIP_BAD)
 
 
 def active_read_ref(db_path: str | None = None) -> str:
-    with get_db(db_path) as conn:
-        return _meta_get(conn, f"{_SLUG}_active_read", _OLD)
+    return READ_CUTOVER if active_pin(db_path) else READ_OLD
 
 
 def cutover_fp(db_path: str | None = None) -> str:
-    with get_db(db_path) as conn:
-        return _meta_get(conn, f"{_SLUG}_cutover_fp", "")
+    pin = active_pin(db_path)
+    return pin["bad_fingerprint"] if pin else ""
 
 
 def reject_refresh(db_path: str | None = None) -> bool:
+    if not active_pin(db_path):
+        return False
     with get_db(db_path) as conn:
-        return _meta_get(conn, f"{_SLUG}_reject_refresh", "0") == "1"
+        return _meta_get(conn, f"{SLUG}_reject_refresh", "0") == "1"
 
 
-def live_flag(db_path: str | None = None) -> str:
+def pinned_batch_code(db_path: str | None = None) -> str:
+    return (active_pin(db_path) or {}).get("batch_code", "")
+
+
+def active_pin(db_path: str | None = None) -> dict | None:
     with get_db(db_path) as conn:
-        return _meta_get(conn, f"{_SLUG}_live_flag", "")
+        row = conn.execute(
+            "SELECT * FROM pin_batch_ledger ORDER BY id LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
 
 
-def archive_rows(db_path: str | None = None) -> list[dict]:
+def ledger_rows(db_path: str | None = None) -> list[dict]:
     with get_db(db_path) as conn:
         rows = conn.execute(
-            "SELECT key, value FROM meta WHERE key LIKE ? ORDER BY key",
-            (f"{_SLUG}_archive_%",),
+            "SELECT * FROM pin_batch_ledger ORDER BY id"
         ).fetchall()
-        return [{"key": r["key"], "value": r["value"]} for r in rows]
+        return [dict(r) for r in rows]
 
 
-def pack_rows(db_path: str | None = None) -> list[dict]:
+def snapshot_rows(db_path: str | None = None) -> list[dict]:
     with get_db(db_path) as conn:
         rows = conn.execute(
-            "SELECT key, value FROM meta WHERE key LIKE ? ORDER BY key",
-            (f"{_SLUG}_pack_%",),
+            "SELECT * FROM pin_batch_snapshot ORDER BY item_key"
         ).fetchall()
-        return [{"key": r["key"], "value": r["value"]} for r in rows]
+        return [dict(r) for r in rows]
 
 
-def seed_skew(db_path: str | None = None) -> None:
-    with get_db(db_path) as conn:
-        _meta_set(conn, f"{_SLUG}_panel_chip", _OK)
-        _meta_set(conn, f"{_SLUG}_truth", _BAD)
-        _meta_set(conn, f"{_SLUG}_counter", "0")
-        _meta_set(conn, f"{_SLUG}_gate_bypass", "1")
-        _meta_set(conn, f"{_SLUG}_active_read", _OLD)
-        _meta_set(conn, f"{_SLUG}_cutover_fp", "")
-        _meta_set(conn, f"{_SLUG}_reject_refresh", "0")
-        _meta_set(conn, f"{_SLUG}_live_flag", "")
-        _meta_set(conn, f"{_SLUG}_mode", "")
-        _meta_set(conn, f"{_SLUG}_old_track", "pending|stale")
-        _meta_set(conn, f"{_SLUG}_pack_decoy", "stale-fp|pending")
+# ------------------------------------------------------------------ 落点
+def commit_batch(batch_id: int, note: str = "", db_path: str | None = None) -> dict:
+    """整笔提交钉批落点：批次号 + 坏件指纹 + 快照行，一并成功或一并失败。"""
+    try:
+        with get_db(db_path) as conn:
+            # 串行化：抢到写锁后再判重，后到者必见先到者的落点。
+            conn.execute("BEGIN IMMEDIATE")
+            batch = conn.execute(
+                "SELECT * FROM capture_batches WHERE id=?", (int(batch_id),)
+            ).fetchone()
+            if not batch:
+                raise ServiceError("批次不存在，钉批未落台")
 
+            existing = conn.execute(
+                "SELECT * FROM pin_batch_ledger ORDER BY id LIMIT 1"
+            ).fetchone()
+            if existing:
+                raise ServiceError(
+                    f"已钉批 {existing['batch_code']}，同一读轨禁止再次钉批或双开",
+                    409,
+                )
 
-def paint_ok(db_path: str | None = None) -> str:
-    with get_db(db_path) as conn:
-        _meta_set(conn, f"{_SLUG}_panel_chip", _OK)
-        _meta_set(conn, f"{_SLUG}_display_only", "1")
-    return _OK
+            items = conn.execute(
+                """
+                SELECT id, item_key, quality, payload FROM capture_items
+                WHERE batch_id=? AND quality!='合格'
+                ORDER BY item_key
+                """,
+                (batch["id"],),
+            ).fetchall()
+
+            h = hashlib.sha256()
+            for it in items:
+                h.update(
+                    f"{it['item_key']}\x1f{it['quality']}\x1f{it['payload']}\x1e".encode(
+                        "utf-8"
+                    )
+                )
+            fingerprint = h.hexdigest()[:16]
+
+            cur = conn.execute(
+                """
+                INSERT INTO pin_batch_ledger(
+                  batch_id, batch_code, bad_fingerprint, bad_count, note
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (batch["id"], batch["batch_code"], fingerprint, len(items), note or ""),
+            )
+            ledger_id = cur.lastrowid
+            conn.executemany(
+                """
+                INSERT INTO pin_batch_snapshot(
+                  ledger_id, item_id, item_key, quality, item_fingerprint
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        ledger_id,
+                        it["id"],
+                        it["item_key"],
+                        it["quality"],
+                        _item_fingerprint(it["item_key"], it["quality"], it["payload"]),
+                    )
+                    for it in items
+                ],
+            )
+
+            _meta_set(conn, f"{SLUG}_panel_chip", CHIP_OK)
+            _meta_set(conn, f"{SLUG}_pinned_batch_code", batch["batch_code"])
+            _meta_set(conn, f"{SLUG}_reject_refresh", "1")
+            _meta_set(conn, f"{SLUG}_active_read", READ_CUTOVER)
+            _meta_set(conn, f"{SLUG}_fingerprint", fingerprint)
+            conn.execute(
+                """
+                INSERT INTO audit_events(actor, action, entity_type, entity_id, detail)
+                VALUES ('admin', '钉批落台', 'pin_batch', ?, ?)
+                """,
+                (
+                    ledger_id,
+                    f"{batch['batch_code']} fp={fingerprint} bad={len(items)}",
+                ),
+            )
+    except ServiceError:
+        raise
+    except sqlite3.IntegrityError:
+        # 另一写入者已抢先落点，本笔整笔回滚。
+        raise ServiceError("已钉批，同一读轨禁止再次钉批或双开", 409) from None
+    except sqlite3.OperationalError as exc:
+        raise ServiceError(f"钉批写入失败，请稍后重试：{exc}", 409) from exc
+
+    return {
+        "ok": True,
+        "chip": CHIP_OK,
+        "title": TITLE,
+        "batch_id": batch["id"],
+        "batch_code": batch["batch_code"],
+        "fingerprint": fingerprint,
+        "bad_count": len(items),
+        "active_read": READ_CUTOVER,
+        "reject_refresh": True,
+        "message": f"{TITLE}已落台：{batch['batch_code']}",
+    }
 
 
 def commit_action(payload: dict | None = None, db_path: str | None = None) -> dict:
-    """Broken: lights chip, leaves old_track as active read, no durable fate."""
+    """后台落台入口：必须点名批次，整笔提交。"""
     payload = payload or {}
-    with get_db(db_path) as conn:
-        c = int(_meta_get(conn, f"{_SLUG}_counter", "0") or "0") + 1
-        _meta_set(conn, f"{_SLUG}_counter", str(c))
-        _meta_set(conn, f"{_SLUG}_panel_chip", _OK)
-        _meta_set(conn, f"{_SLUG}_last_payload", str(payload)[:200])
-        _meta_set(conn, f"{_SLUG}_gate_bypass", "1")
-        _meta_set(conn, f"{_SLUG}_active_read", _OLD)
-        _meta_set(conn, f"{_SLUG}_reject_refresh", "0")
-        if not _meta_get(conn, f"{_SLUG}_cutover_fp", ""):
-            _meta_set(conn, f"{_SLUG}_cutover_fp", "stale-fp")
-        _meta_set(
-            conn,
-            f"{_SLUG}_pack_decoy",
-            f"stale-fp|{c}|{str(payload)[:80]}",
+    raw = payload.get("batch_id")
+    try:
+        batch_id = int(raw)
+    except (TypeError, ValueError):
+        raise ServiceError("钉批必须点名批次，未落台") from None
+    if batch_id <= 0:
+        raise ServiceError("钉批必须点名批次，未落台")
+    return commit_batch(batch_id, str(payload.get("note") or ""), db_path)
+
+
+# ------------------------------------------------------------------ 闸
+def _misalign_reasons(conn, ledger: dict | None, chip: str) -> list[str]:
+    reasons: list[str] = []
+    if not ledger:
+        reasons.append("库无钉批落点")
+        if chip == CHIP_OK:
+            reasons.append("只有钉批芯片、无落点行")
+        return reasons
+
+    if chip != CHIP_OK:
+        reasons.append("钉批芯片未亮")
+    shown_code = _meta_get(conn, f"{SLUG}_pinned_batch_code", ledger["batch_code"])
+    if shown_code != ledger["batch_code"]:
+        reasons.append(
+            f"钉批芯片批次号与落点对不齐（芯片{shown_code} / 落点{ledger['batch_code']}）"
         )
-        _meta_set(conn, f"{_SLUG}_truth", _BAD)
-        _meta_set(conn, f"{_SLUG}_mode", "")
-        _meta_set(conn, f"{_SLUG}_live_flag", "")
-    return {
-        "ok": True,
-        "chip": _OK,
-        "title": _TITLE,
-        "counter": c,
-        "active_read": active_read_ref(db_path),
-        "cutover_fp": cutover_fp(db_path),
-        "reject_refresh": reject_refresh(db_path),
-        "archive_count": len(archive_rows(db_path)),
-        "live_flag": live_flag(db_path),
-        "message": f"{_TITLE}已落台",
-    }
+    if _meta_get(conn, f"{SLUG}_reject_refresh", "0") != "1":
+        reasons.append("钉批未拒回刷")
 
-
-def half_fix_display(db_path: str | None = None) -> dict:
-    paint_ok(db_path)
-    return {
-        "panel_chip": panel_chip(db_path),
-        "truth": truth_flag(db_path),
-        "active_read": active_read_ref(db_path),
-        "archive_count": len(archive_rows(db_path)),
-        "half_fixed": True,
-    }
+    items = conn.execute(
+        """
+        SELECT item_key, quality, payload FROM capture_items
+        WHERE batch_id=? AND quality!='合格'
+        ORDER BY item_key
+        """,
+        (ledger["batch_id"],),
+    ).fetchall()
+    h = hashlib.sha256()
+    for it in items:
+        h.update(
+            f"{it['item_key']}\x1f{it['quality']}\x1f{it['payload']}\x1e".encode("utf-8")
+        )
+    if h.hexdigest()[:16] != ledger["bad_fingerprint"]:
+        reasons.append(
+            f"坏件指纹拧花：落点{ledger['bad_fingerprint']} / 现行{h.hexdigest()[:16]}"
+        )
+    return reasons
 
 
 def snapshot(db_path: str | None = None) -> dict:
-    seed_skew(db_path)
-    rows = pack_rows(db_path)
-    durable = [r for r in rows if not str(r.get("key", "")).endswith("_decoy")]
-    ref = active_read_ref(db_path)
+    with get_db(db_path) as conn:
+        ledger = conn.execute(
+            "SELECT * FROM pin_batch_ledger ORDER BY id LIMIT 1"
+        ).fetchone()
+        ledger = dict(ledger) if ledger else None
+        chip = _meta_get(conn, f"{SLUG}_panel_chip", CHIP_BAD)
+        reasons = _misalign_reasons(conn, ledger, chip)
+        reject_ok = bool(ledger) and (
+            _meta_get(conn, f"{SLUG}_reject_refresh", "0") == "1"
+        )
     return {
-        "title": _TITLE,
-        "panel_chip": panel_chip(db_path),
-        "truth": truth_flag(db_path),
-        "pack_count": len(rows),
-        "active_read": ref,
-        "cutover_fp": cutover_fp(db_path),
-        "reject_refresh": reject_refresh(db_path),
-        "archive_count": len(archive_rows(db_path)),
-        "live_flag": live_flag(db_path),
-        "aligned": panel_chip(db_path) == truth_flag(db_path)
-        and truth_flag(db_path) == _OK
-        and ref in (_CUTOVER, _LIVE)
-        and (
-            (ref == _CUTOVER and reject_refresh(db_path) and cutover_fp(db_path) not in ("", "stale-fp"))
-            or (ref == _LIVE and live_flag(db_path) and len(archive_rows(db_path)) > 0)
-        ),
-        "gate_bypass": True,
-        "durable_count": len(durable),
+        "title": TITLE,
+        "chip": chip,
+        "panel_chip": chip,
+        "ledger_present": ledger is not None,
+        "batch_id": ledger["batch_id"] if ledger else 0,
+        "batch_code": ledger["batch_code"] if ledger else "",
+        "pinned_fingerprint": ledger["bad_fingerprint"] if ledger else "",
+        "bad_count": ledger["bad_count"] if ledger else 0,
+        "active_read": READ_CUTOVER if ledger else READ_OLD,
+        "reject_refresh": reject_ok,
+        "fingerprint_match": ledger is not None
+        and not any("指纹" in r for r in reasons),
+        "aligned": ledger is not None and not reasons,
+        "gate_allows": ledger is not None and not reasons,
+        "misalign_reasons": reasons,
     }
 
 
 def gate_allows_pipeline(db_path: str | None = None) -> bool:
-    with get_db(db_path) as conn:
-        bypass = _meta_get(conn, f"{_SLUG}_gate_bypass", "1")
-        if bypass == "1":
-            return True
-        ref = _meta_get(conn, f"{_SLUG}_active_read", _OLD)
-        fp = _meta_get(conn, f"{_SLUG}_cutover_fp", "")
-        if ref == _CUTOVER and _meta_get(conn, f"{_SLUG}_reject_refresh", "0") == "1":
-            return fp not in ("", "stale-fp")
-        if ref == _LIVE:
-            return bool(_meta_get(conn, f"{_SLUG}_live_flag", ""))
-        return False
-
-
-def dashboard(db_path: str | None = None) -> dict:
-    snap = snapshot(db_path)
-    rows = pack_rows(db_path)
-    durable = [r for r in rows if not str(r.get("key", "")).endswith("_decoy")]
-    return {
-        "title": _TITLE,
-        "chip": snap["panel_chip"],
-        "truth": snap["truth"],
-        "pack_count": snap["pack_count"],
-        "durable_count": len(durable),
-        "rows": rows,
-        "active_read": snap["active_read"],
-        "cutover_fp": snap["cutover_fp"],
-        "reject_refresh": snap["reject_refresh"],
-        "archive_count": snap["archive_count"],
-        "live_flag": snap["live_flag"],
-        "aligned": snap["aligned"],
-        "panel_pack_mismatch": snap["panel_chip"] == _OK and not snap["aligned"],
-        "ok_chip": _OK,
-        "bad_chip": _BAD,
-        "label": "钉批落定",
-        "read_tracks": {
-            "old_track": _OLD,
-            "cutover_book": _CUTOVER,
-            "live_flag": _LIVE,
-        },
-    }
-
-
-def list_events(db_path: str | None = None) -> list[dict]:
-    with get_db(db_path) as conn:
-        rows = conn.execute(
-            "SELECT key, value FROM meta WHERE key LIKE ? ORDER BY key",
-            (f"{_SLUG}_evt_%",),
-        ).fetchall()
-        return [{"key": r["key"], "note": r["value"]} for r in rows]
-
-
-def record_event(note: str, db_path: str | None = None) -> dict:
-    with get_db(db_path) as conn:
-        c = int(_meta_get(conn, f"{_SLUG}_counter", "0") or "0") + 1
-        _meta_set(conn, f"{_SLUG}_counter", str(c))
-        _meta_set(conn, f"{_SLUG}_evt_{c}", note or _BAD)
-        _meta_set(conn, f"{_SLUG}_panel_chip", _OK)
-    return dashboard(db_path)
-
-
-def reconcile_display(db_path: str | None = None) -> dict:
-    return half_fix_display(db_path)
+    return snapshot(db_path)["gate_allows"]
 
 
 def require_pack_or_raise(db_path: str | None = None) -> None:
     snap = snapshot(db_path)
-    if not snap["aligned"]:
-        raise ServiceError(f"{_TITLE}读轨未对齐，禁止放行", 409)
+    if not snap["gate_allows"]:
+        detail = "；".join(snap["misalign_reasons"]) or "读轨未对齐"
+        raise ServiceError(f"{TITLE}已挡住：{detail}", 409)

@@ -1,66 +1,56 @@
-"""对账钉批切流账册：应锁当刻指纹并拒回刷；当前只记软笔记。"""
+"""对账钉批切流账册：钉批唯一读轨。双写两轨禁止双开。"""
 from __future__ import annotations
 
-from app.db import get_db
-from app.services.pin_batch import (
-    active_read_ref,
-    cutover_fp,
-    dashboard,
-    panel_chip,
-    record_event,
-    reject_refresh,
-    truth_flag,
-)
+from app.services import pin_batch as pin_svc
+from app.services.errors import ServiceError
 
-_SLUG = "pin_batch"
-_TITLE = "对账钉批"
-_OK = "钉批已亮"
-_BAD = "库无钉批"
+SLUG = "pin_batch"
 
 
 def append_cutover(ref_id: int, note: str, db_path: str | None = None) -> dict:
-    with get_db(db_path) as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
-            (f"{_SLUG}_cutover_note_{ref_id}", note or _TITLE),
-        )
-        # missing: durable fp lock + reject_refresh=1 + active_read=cutover_book
-        conn.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
-            (f"{_SLUG}_panel_chip", _OK),
-        )
-    record_event(f"cutover-note ref={ref_id} {note}", db_path)
-    return {
-        "ref_id": ref_id,
-        "note": note,
-        "panel": panel_chip(db_path),
-        "truth": truth_flag(db_path),
-        "active_read": active_read_ref(db_path),
-        "cutover_fp": cutover_fp(db_path),
-        "reject_refresh": reject_refresh(db_path),
-    }
+    """点名批次落台；ref_id 即批次 id。旧的软笔记路径不再写读轨。"""
+    if not ref_id:
+        raise ServiceError("切流账册必须点名批次，未落台")
+    out = pin_svc.commit_action({"batch_id": ref_id, "note": note}, db_path)
+    out["ref_id"] = ref_id
+    return out
 
 
 def cutover_rows(db_path: str | None = None) -> list[dict]:
-    with get_db(db_path) as conn:
-        rows = conn.execute(
-            "SELECT key, value FROM meta WHERE key LIKE ? ORDER BY key",
-            (f"{_SLUG}_cutover_%",),
-        ).fetchall()
-        return [
-            {
-                "key": r["key"],
-                "value": r["value"],
-                "chip": panel_chip(db_path),
-                "active_read": active_read_ref(db_path),
-            }
-            for r in rows
-        ]
+    snap = pin_svc.snapshot(db_path)
+    return [
+        {
+            "batch_id": row["batch_id"],
+            "batch_code": row["batch_code"],
+            "fingerprint": row["bad_fingerprint"],
+            "bad_count": row["bad_count"],
+            "chip": snap["chip"],
+            "active_read": snap["active_read"],
+        }
+        for row in pin_svc.ledger_rows(db_path)
+    ]
 
 
 def board(db_path: str | None = None) -> dict:
-    dash = dashboard(db_path)
-    dash["cutover"] = cutover_rows(db_path)
-    dash["fate"] = "cutover_book"
-    dash["panel_pack_mismatch"] = dash.get("panel_pack_mismatch", True)
-    return dash
+    snap = pin_svc.snapshot(db_path)
+    return {
+        "title": pin_svc.TITLE,
+        "chip": snap["chip"],
+        "panel_chip": snap["chip"],
+        "batch_code": snap["batch_code"],
+        "pinned_fingerprint": snap["pinned_fingerprint"],
+        "bad_count": snap["bad_count"],
+        "active_read": snap["active_read"],
+        "reject_refresh": snap["reject_refresh"],
+        "fingerprint_match": snap["fingerprint_match"],
+        "gate_allows": snap["gate_allows"],
+        "aligned": snap["aligned"],
+        "misalign_reasons": snap["misalign_reasons"],
+        "cutover": cutover_rows(db_path),
+        "fate": "cutover_book",
+    }
+
+
+def require_ready(db_path: str | None = None) -> None:
+    if pin_svc.snapshot(db_path)["active_read"] != pin_svc.READ_CUTOVER:
+        raise ServiceError("切流账册未落台，禁止继续", 409)

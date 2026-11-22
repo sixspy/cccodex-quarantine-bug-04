@@ -1,5 +1,5 @@
 
-from app.services import captures, policies, sources, audit
+from app.services import captures, pin_batch, policies, sources, audit
 
 
 def test_source_and_policy_chain(db_path):
@@ -10,6 +10,8 @@ def test_source_and_policy_chain(db_path):
     batch = captures.create_batch("站内目录戊", "策略批", db_path)
     captures.add_item(batch["id"], "sku-e1", "{}", "缺字段", db_path)
     captures.add_item(batch["id"], "sku-e2", "", "编码空", db_path)
+    # 清洗编排继续执行前需钉批落点对齐。
+    pin_batch.commit_batch(batch["id"], "策略用例", db_path)
     result = policies.apply_to_batch(batch["id"], db_path)
     assert result["entered"] >= 2
     events = audit.list_events(50, db_path)

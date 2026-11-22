@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from app.db import get_db
 from app.services import audit as audit_svc
+from app.services import pin_batch as pin_batch_svc
 from app.services import settings as settings_svc
-from app.services.errors import ServiceError
 
 
 def list_reports(db_path: str | None = None) -> list[dict]:
@@ -14,8 +14,31 @@ def list_reports(db_path: str | None = None) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def report_rows(db_path: str | None = None, limit: int = 50) -> list[dict]:
+    """对账页只读引用：报告行 + 当刻钉批芯片 / 批次号 / 落点。"""
+    pin = pin_batch_svc.snapshot(db_path)
+    with get_db(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM reconcile_reports ORDER BY id DESC LIMIT ?",
+            (max(1, int(limit)),),
+        ).fetchall()
+        out = []
+        for r in rows:
+            item = dict(r)
+            item["chip"] = pin["chip"]
+            item["pinned_batch_code"] = pin["batch_code"]
+            item["pinned_fingerprint"] = pin["pinned_fingerprint"]
+            item["fingerprint_match"] = pin["fingerprint_match"]
+            item["gate_allows"] = pin["gate_allows"]
+            item["misalign_reasons"] = pin["misalign_reasons"]
+            out.append(item)
+        return out
+
+
 def run_reconcile(db_path: str | None = None) -> dict:
     label = settings_svc.get_value("reconcile_label", "隔离对账", db_path)
+    # 先读钉批落点（只读），对账绝不改写钉批。
+    pin = pin_batch_svc.snapshot(db_path)
     with get_db(db_path) as conn:
         open_rows = conn.execute(
             "SELECT COUNT(*) AS c FROM quarantine_rows WHERE status='待复核'"
@@ -40,20 +63,39 @@ def run_reconcile(db_path: str | None = None) -> dict:
               )
             """
         ).fetchone()["c"]
+
+        if pin["ledger_present"]:
+            pin_note = (
+                f"批次{pin['batch_code']}"
+                f"·落点{pin['pinned_fingerprint']}"
+                f"·指纹{'对齐' if pin['fingerprint_match'] else '拧花'}"
+                f"·闸{'开' if pin['gate_allows'] else '挡'}"
+            )
+        else:
+            pin_note = "库无落点"
         summary = (
-            f"{label}：待复核{open_rows} / 已放行{released} / 回炉中{reworking} / "
-            f"已废弃{abandoned} / 错位{mismatch}"
+            f"{label}：{pin_note} / 待复核{open_rows} / 已放行{released} / "
+            f"回炉中{reworking} / 已废弃{abandoned} / 错位{mismatch}"
         )
-        from app.services.pin_batch import commit_action, panel_chip, active_read_ref
-        commit_action({"open": open_rows}, db_path)
-        summary = f"钉批{panel_chip(db_path)}读轨{active_read_ref(db_path)}：待复核{open_rows} / 已放行{released}"
         cur = conn.execute(
             """
             INSERT INTO reconcile_reports(
-              summary, open_rows, released, reworking, abandoned, mismatch
-            ) VALUES (?,?,?,?,?,?)
+              summary, open_rows, released, reworking, abandoned, mismatch,
+              pinned_batch_code, pinned_fingerprint, fingerprint_match, gate_allows
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)
             """,
-            (summary, open_rows, released, 0, abandoned, 0),
+            (
+                summary,
+                open_rows,
+                released,
+                reworking,
+                abandoned,
+                mismatch,
+                pin["batch_code"],
+                pin["pinned_fingerprint"],
+                1 if pin["fingerprint_match"] else 0,
+                1 if pin["gate_allows"] else 0,
+            ),
         )
         report_id = cur.lastrowid
         row = conn.execute(
@@ -61,8 +103,9 @@ def run_reconcile(db_path: str | None = None) -> dict:
         ).fetchone()
     audit_svc.write_event("生成对账", "reconcile_report", report_id, summary, db_path=db_path)
     out = dict(row)
-    out["chip"] = "钉批已亮"
-    out["active_read"] = "old_track"
+    out["chip"] = pin["chip"]
+    out["active_read"] = pin["active_read"]
+    out["misalign_reasons"] = pin["misalign_reasons"]
     return out
 
 
@@ -87,5 +130,6 @@ def dashboard(db_path: str | None = None) -> dict:
                 "SELECT COUNT(*) AS c FROM policy_rules WHERE enabled=1"
             ).fetchone()["c"],
             "audits": conn.execute("SELECT COUNT(*) AS c FROM audit_events").fetchone()["c"],
+            "pin_batch": pin_batch_svc.snapshot(db_path),
             "pin_batch_audit": _pin_batch_audit(db_path),
         }
